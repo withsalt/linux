@@ -2,9 +2,12 @@
 #define _QCOM_BATTMGR_H_
 
 #include <linux/power_supply.h>
+#include <linux/spinlock.h>
+
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 
+#include "qcom_battmgr_charge_limit.h"
 
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
@@ -207,6 +210,28 @@ struct qcom_battmgr {
 	struct completion ack;
 
 	bool service_up;
+	/* Serialize callback work submission with the Oplus teardown gate. */
+	spinlock_t event_lock;
+	unsigned int pending_opcode;
+	unsigned int pending_property;
+
+	/* Negroni host policy, shared with the Oplus protocol driver. */
+	bool invert_current;
+	bool charge_limit_supported;
+	bool gauge_init_done;
+	bool adsp_suspended_chg;
+	struct qcom_battmgr_charge_limit charge_limit; /* protected by lock */
+	bool charge_limit_applied;
+	bool charge_limit_applied_valid;
+	bool charge_limit_vooc_disabled; /* Disabled, deferred or awaiting an enable retry. */
+	int charge_limit_error;
+	unsigned int charge_limit_soc_raw;
+	unsigned int service_generation;
+	unsigned int charge_limit_generation;
+	struct delayed_work charge_limit_work;
+	struct work_struct notification_work;
+	unsigned long pending_notifications;
+	bool stopping;
 
 	struct qcom_battmgr_info info;
 	struct qcom_battmgr_status status;

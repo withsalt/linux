@@ -11,6 +11,8 @@
 #include <linux/pinctrl/consumer.h>
 #include <linux/gpio.h>
 #include <linux/of_device.h>
+#include <linux/of.h>
+#include <linux/pm.h>
 #include <linux/property.h>
 #include <linux/math.h>
 #include <linux/units.h>
@@ -22,23 +24,325 @@
 
 static const u8 usb_prop_map[USB_PROP_MAX];
 
+/* SM8450 places these three USB telemetry IDs after GET_BATT_CURR. */
+static int oplus_battmgr_usb_wire_property(int property)
+{
+	if (property >= USB_TEMP && property <= USB_TYPEC_COMPLIANT)
+		return USB_GET_BATT_CURR - 2 + property - USB_TEMP;
+	if (property >= USB_ADAP_SUBTYPE && property <= USB_GET_BATT_CURR)
+		return property - 3;
+	return property;
+}
+
+static int oplus_battmgr_usb_logical_property(int property)
+{
+	if (property >= USB_GET_BATT_CURR - 2 && property <= USB_GET_BATT_CURR)
+		return USB_TEMP + property - (USB_GET_BATT_CURR - 2);
+	if (property >= USB_ADAP_SUBTYPE - 3 && property < USB_GET_BATT_CURR - 2)
+		return property + 3;
+	return property;
+}
+
+static int oplus_battmgr_request_property_locked(struct qcom_battmgr *battmgr,
+					       int opcode, int property, u32 value)
+{
+	unsigned int generation = READ_ONCE(battmgr->service_generation);
+	int wire_property = property;
+	int ret;
+
+	lockdep_assert_held(&battmgr->lock);
+	if (battmgr->charge_limit_supported) {
+		bool blocked = battmgr->charge_limit.enabled &&
+			       (battmgr->charge_limit.cutoff ||
+				battmgr->charge_limit_generation !=
+				READ_ONCE(battmgr->service_generation));
+
+		/* Cover initialization, hotplug and the vendor charging workers. */
+		if (opcode == BC_BATTERY_STATUS_SET &&
+		    (property == BATT_CHG_EN || property == BATT_SEND_CHG_STATUS) &&
+		    (blocked || READ_ONCE(battmgr->adsp_suspended_chg)))
+			value = 0;
+		if (opcode == BC_USB_STATUS_SET && blocked &&
+		    ((value && (property == USB_VOOCPHY_ENABLE ||
+				property == USB_VOOCPHY_RESET_AGAIN ||
+				property == USB_PPS_VOOCPHY_ENABLE ||
+				property == USB_SUSPEND_PMIC)) ||
+		     (!value && property == USB_INPUT_CURR_LIMIT))) {
+			/* A fresh SOC sample must replay initialization after release. */
+			if (value && property == USB_VOOCPHY_ENABLE)
+				battmgr->charge_limit_vooc_disabled = true;
+			return 0;
+		}
+	}
+	if (battmgr->charge_limit_supported &&
+	    (opcode == BC_USB_STATUS_GET || opcode == BC_USB_STATUS_SET))
+		wire_property = oplus_battmgr_usb_wire_property(property);
+	ret = qcom_battmgr_request_property(battmgr, opcode, wire_property, value);
+	if (!ret && battmgr->charge_limit_supported &&
+	    (!READ_ONCE(battmgr->service_up) ||
+	     generation != READ_ONCE(battmgr->service_generation)))
+		ret = -EAGAIN;
+	/* Cache the effective, acknowledged command, including policy overrides. */
+	if (opcode == BC_BATTERY_STATUS_SET && property == BATT_CHG_EN) {
+		battmgr->bcdev->chg_en = !ret && value;
+		if (ret && battmgr->charge_limit_supported)
+			battmgr->charge_limit_applied_valid = false;
+	}
+	if (battmgr->charge_limit_supported && opcode == BC_USB_STATUS_SET &&
+	    property == USB_VOOCPHY_ENABLE && value)
+		battmgr->charge_limit_vooc_disabled = !!ret;
+	return ret;
+}
+
 static int oplus_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
 					 int property, u32 value)
 {
 	int ret;
 
 	mutex_lock(&battmgr->lock);
-	ret = qcom_battmgr_request_property(battmgr, opcode, property, value);
+	ret = oplus_battmgr_request_property_locked(battmgr, opcode, property, value);
 	mutex_unlock(&battmgr->lock);
 	return ret;
 }
 
 
-static int oplus_ap_init_adsp_gague(struct qcom_battmgr *battmgr)
+/* All policy evaluation and command writes run under battmgr->lock. */
+static int oplus_battmgr_apply_negroni_charge_limit(struct qcom_battmgr *battmgr)
 {
+	bool cutoff = battmgr->charge_limit.enabled && battmgr->charge_limit.cutoff;
+	unsigned int generation = READ_ONCE(battmgr->service_generation);
 	int ret;
 
-	ret = oplus_battmgr_request_property(battmgr, BC_BATTERY_STATUS_SET, BATT_ADSP_GAUGE_INIT, 1);
+	lockdep_assert_held(&battmgr->lock);
+	if (!battmgr->service_up || !battmgr->gauge_init_done)
+		return -EAGAIN;
+
+	if (battmgr->charge_limit_generation != generation)
+		battmgr->charge_limit_applied_valid = false;
+	if (battmgr->charge_limit_applied_valid &&
+	    battmgr->charge_limit_applied == cutoff &&
+	    (cutoff || !battmgr->charge_limit_vooc_disabled))
+		return 0;
+	/* A timeout can mean the hardware changed without an ACK. */
+	battmgr->charge_limit_applied_valid = false;
+
+	/* Stock Oplus also exits the independent VOOC fast-charge path. */
+	if (cutoff) {
+		ret = oplus_battmgr_request_property_locked(battmgr, BC_USB_STATUS_GET,
+						    USB_ADAP_TYPE, 0);
+		if (ret)
+			return ret;
+		if (battmgr->usb.usb_type == POWER_SUPPLY_USB_TYPE_DCP) {
+			/* Remember even a timeout: the command might have reached ADSP. */
+			battmgr->charge_limit_vooc_disabled = true;
+			ret = oplus_battmgr_request_property_locked(battmgr, BC_USB_STATUS_SET,
+							    USB_VOOCPHY_ENABLE, 0);
+			if (ret)
+				return ret;
+		}
+	}
+
+	/* Do not suspend USB input, change PDO, or force battery discharge. */
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_SET,
+					    BATT_CHG_EN, !cutoff);
+	if (ret)
+		return ret;
+	if (!cutoff && battmgr->charge_limit_vooc_disabled &&
+	    !READ_ONCE(battmgr->adsp_suspended_chg)) {
+		ret = oplus_battmgr_request_property_locked(battmgr, BC_USB_STATUS_SET,
+						    USB_VOOCPHY_ENABLE, 1);
+		if (ret)
+			return ret;
+		battmgr->charge_limit_vooc_disabled = false;
+	}
+	if (generation != READ_ONCE(battmgr->service_generation) || !battmgr->service_up)
+		return -EAGAIN;
+
+	battmgr->charge_limit_applied = cutoff;
+	battmgr->charge_limit_applied_valid = true;
+	battmgr->charge_limit_generation = generation;
+	dev_info(battmgr->dev, "charge limit: %s, thresholds %u/%u%%; USB input retained\n",
+		 cutoff ? "holding" : "released", battmgr->charge_limit.start,
+		 battmgr->charge_limit.end);
+	power_supply_changed(battmgr->bat_psy);
+	return 0;
+}
+
+static int oplus_battmgr_refresh_negroni_charge_limit(struct qcom_battmgr *battmgr)
+{
+	unsigned int generation = READ_ONCE(battmgr->service_generation);
+	int ret = 0, sample_ret = 0;
+
+	lockdep_assert_held(&battmgr->lock);
+	if (!battmgr->service_up || !battmgr->gauge_init_done)
+		return -EAGAIN;
+
+	if (battmgr->charge_limit.enabled) {
+		if (battmgr->charge_limit_generation != generation)
+			battmgr->charge_limit_applied_valid = false;
+		battmgr->charge_limit_soc_raw = ~0U;
+		sample_ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_GET,
+							   BATT_CAPACITY, 0);
+		if (!sample_ret && battmgr->charge_limit_soc_raw > 10000)
+			sample_ret = -ENODATA;
+		if (!sample_ret && generation != READ_ONCE(battmgr->service_generation))
+			sample_ret = -EAGAIN;
+		qcom_battmgr_charge_limit_sample(&battmgr->charge_limit,
+			battmgr->charge_limit_soc_raw / 100,
+			!sample_ret && battmgr->charge_limit_soc_raw <= 10000 &&
+			generation == READ_ONCE(battmgr->service_generation));
+		if (!sample_ret)
+			battmgr->charge_limit_generation = generation;
+	} else {
+		battmgr->charge_limit.cutoff = false;
+	}
+	ret = oplus_battmgr_apply_negroni_charge_limit(battmgr);
+	return ret ? ret : sample_ret;
+}
+
+static void oplus_battmgr_charge_limit_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+					struct qcom_battmgr, charge_limit_work);
+	bool retry;
+
+	mutex_lock(&battmgr->lock);
+	if (READ_ONCE(battmgr->stopping)) {
+		mutex_unlock(&battmgr->lock);
+		return;
+	}
+	battmgr->charge_limit_error = oplus_battmgr_refresh_negroni_charge_limit(battmgr);
+	retry = battmgr->charge_limit.enabled || battmgr->charge_limit_error ||
+		battmgr->charge_limit_vooc_disabled;
+	if (battmgr->charge_limit_error && battmgr->charge_limit_error != -EAGAIN)
+		dev_warn_ratelimited(battmgr->dev, "charge limit: update failed: %d\n",
+				     battmgr->charge_limit_error);
+	if (retry)
+		mod_delayed_work(system_wq, &battmgr->charge_limit_work,
+				 msecs_to_jiffies(5000));
+	mutex_unlock(&battmgr->lock);
+}
+
+static ssize_t charge_limit_enable_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
+	ssize_t ret;
+
+	mutex_lock(&battmgr->lock);
+	ret = sysfs_emit(buf, "%u\n", battmgr->charge_limit.enabled);
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
+static ssize_t charge_limit_enable_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+	mutex_lock(&battmgr->lock);
+	if (READ_ONCE(battmgr->stopping)) {
+		mutex_unlock(&battmgr->lock);
+		return -ENODEV;
+	}
+	/* A new policy starts holding in the hysteresis band, until <= start. */
+	if (enable && !battmgr->charge_limit.enabled)
+		battmgr->charge_limit.cutoff = true;
+	battmgr->charge_limit.enabled = enable;
+	if (!enable)
+		battmgr->charge_limit.cutoff = false;
+	battmgr->charge_limit_applied_valid = false;
+	ret = oplus_battmgr_refresh_negroni_charge_limit(battmgr);
+	battmgr->charge_limit_error = ret;
+	mod_delayed_work(system_wq, &battmgr->charge_limit_work, msecs_to_jiffies(5000));
+	mutex_unlock(&battmgr->lock);
+	/* Disabling is accepted even while ADSP is down; restoration is retried. */
+	return ret && enable ? ret : count;
+}
+
+static ssize_t charge_limit_status_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(dev_get_drvdata(dev));
+	const char *state;
+	ssize_t ret;
+
+	mutex_lock(&battmgr->lock);
+	if (battmgr->charge_limit_error || !battmgr->charge_limit_applied_valid ||
+	    battmgr->charge_limit_generation != READ_ONCE(battmgr->service_generation))
+		state = "pending";
+	else
+		state = battmgr->charge_limit_applied ? "holding" : "released";
+	ret = sysfs_emit(buf, "enabled=%u state=%s error=%d\n",
+			 battmgr->charge_limit.enabled, state, battmgr->charge_limit_error);
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
+static DEVICE_ATTR_RW(charge_limit_enable);
+static DEVICE_ATTR_RO(charge_limit_status);
+static struct attribute *oplus_battmgr_negroni_attrs[] = {
+	&dev_attr_charge_limit_enable.attr,
+	&dev_attr_charge_limit_status.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(oplus_battmgr_negroni);
+
+static int oplus_battmgr_negroni_set_threshold(struct qcom_battmgr *battmgr,
+					    enum power_supply_property psp, int value)
+{
+	unsigned int start, end;
+	int ret = 0;
+
+	mutex_lock(&battmgr->lock);
+	if (READ_ONCE(battmgr->stopping)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	start = battmgr->charge_limit.start;
+	end = battmgr->charge_limit.end;
+	if (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD)
+		start = value;
+	else
+		end = value;
+	if (!qcom_battmgr_charge_limit_valid(start, end)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	battmgr->charge_limit.start = start;
+	battmgr->charge_limit.end = end;
+	if (battmgr->charge_limit.enabled)
+		mod_delayed_work(system_wq, &battmgr->charge_limit_work, 0);
+out:
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
+static int oplus_ap_init_adsp_gague(struct qcom_battmgr *battmgr)
+{
+	unsigned int generation;
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	generation = READ_ONCE(battmgr->service_generation);
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_SET,
+						   BATT_ADSP_GAUGE_INIT, 1);
+	if (!ret && (READ_ONCE(battmgr->stopping) ||
+		     !READ_ONCE(battmgr->service_up) ||
+		     generation != READ_ONCE(battmgr->service_generation)))
+		ret = -EAGAIN;
+	if (!ret) {
+		battmgr->gauge_init_done = true;
+		if (battmgr->charge_limit_supported)
+			mod_delayed_work(system_wq, &battmgr->charge_limit_work, 0);
+	}
+	mutex_unlock(&battmgr->lock);
 	if (ret)
 		chg_err("init adsp gague fail, ret=%d\n", ret);
 	else
@@ -63,17 +367,12 @@ static int oplus_adsp_voocphy_enable(struct qcom_battmgr *battmgr, bool enable)
 static int smbchg_charging_disable(struct qcom_battmgr *battmgr)
 {
 	int ret;
-	struct battery_chg_dev *bcdev = battmgr->bcdev;
 
-	mutex_lock(&bcdev->chg_en_lock);
-	ret = oplus_battmgr_request_property(battmgr, BC_USB_STATUS_SET, BATT_CHG_EN, 0);
+	ret = oplus_battmgr_request_property(battmgr, BC_BATTERY_STATUS_SET, BATT_CHG_EN, 0);
 	if (ret)
 		chg_err("set disable charging fail, ret=%d\n", ret);
-	else {
-		bcdev->chg_en = false;
+	else
 		chg_err("set disable charging sucess.\n");
-	}
-	mutex_unlock(&bcdev->chg_en_lock);
 
 	return ret;
 }
@@ -81,29 +380,12 @@ static int smbchg_charging_disable(struct qcom_battmgr *battmgr)
 static int smbchg_charging_enable(struct qcom_battmgr *battmgr)
 {
 	int ret;
-	struct battery_chg_dev *bcdev = battmgr->bcdev;
 
-	mutex_lock(&bcdev->chg_en_lock);
-	ret = oplus_battmgr_request_property(battmgr, BC_USB_STATUS_SET, BATT_CHG_EN, 1);
+	ret = oplus_battmgr_request_property(battmgr, BC_BATTERY_STATUS_SET, BATT_CHG_EN, 1);
 	if (ret)
 		chg_err("set enable charging fail, ret=%d\n", ret);
-	else {
-		bcdev->chg_en = true;
+	else
 		chg_err("set enable charging sucess.");
-	}
-	mutex_unlock(&bcdev->chg_en_lock);
-
-	return ret;
-}
-
-static int smbchg_get_charge_enable(struct qcom_battmgr *battmgr)
-{
-	int ret;
-	struct battery_chg_dev *bcdev = battmgr->bcdev;
-
-	mutex_lock(&bcdev->chg_en_lock);
-	ret = bcdev->chg_en;
-	mutex_unlock(&bcdev->chg_en_lock);
 
 	return ret;
 }
@@ -136,20 +418,6 @@ static int smbchg_usb_suspend_disable(struct qcom_battmgr *battmgr)
 		chg_err("set chg unsuspend\n");
 
 	return ret;
-}
-
-static bool smbchg_usb_check_suspend_charger(struct qcom_battmgr *battmgr)
-{
-	struct battery_chg_dev *bcdev = battmgr->bcdev;
-	int ret;
-
-	ret = oplus_battmgr_request_property(battmgr, BC_USB_STATUS_GET, USB_SUSPEND_PMIC, 0);
-	if (ret)
-		chg_err("read chg suspend status fail, ret=%d\n", ret);
-	else
-		chg_err("read chg suspend status[%d]\n", bcdev->usb.usb_suspend_pmic);
-
-	return bcdev->usb.usb_suspend_pmic;
 }
 
 static int oplus_otg_ap_enable(struct qcom_battmgr *battmgr, bool enable)
@@ -385,15 +653,19 @@ static void oplus_chg_status_send_adsp_work(struct work_struct *work)
 	int ret;
 	struct battery_chg_dev *bcdev = container_of(work,
 						     struct battery_chg_dev, chg_status_send_work.work);
-	bool chg_enable = false, chg_suspend = true, chg_status = false;
+	bool chg_status;
 	struct qcom_battmgr *battmgr = bcdev->battmgr;
 
-	chg_enable = smbchg_get_charge_enable(battmgr);
-	chg_suspend = smbchg_usb_check_suspend_charger(battmgr);
-	if (!bcdev->chip->adsp_notify_ap_suspend && chg_enable && !chg_suspend)
-		chg_status = true;
-
-	ret = oplus_battmgr_request_property(battmgr, BC_BATTERY_STATUS_SET, BATT_SEND_CHG_STATUS, chg_status);
+	/* Keep the cache, suspend query and permission reply in one transaction. */
+	mutex_lock(&battmgr->lock);
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_USB_STATUS_GET,
+						   USB_SUSPEND_PMIC, 0);
+	chg_status = !ret && bcdev->chg_en &&
+		     !READ_ONCE(bcdev->chip->adsp_notify_ap_suspend) &&
+		     !bcdev->usb.usb_suspend_pmic;
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_SET,
+						   BATT_SEND_CHG_STATUS, chg_status);
+	mutex_unlock(&battmgr->lock);
 	if (ret)
 		chg_err("send chg status fail, ret=%d\n", ret);
 	else
@@ -452,271 +724,6 @@ static bool oplus_chg_wls_is_present(struct battery_chg_dev *bcdev)
 
 
 
-void oplus_chg_variables_reset(struct oplus_chg_chip *chip, bool in)
-{
-	int i;
-	// oplus_ufcs_variables_reset(in);
-	if (in) {
-		schedule_delayed_work(&chip->check_pd_svooc_work, msecs_to_jiffies(PD_SVOOC_CHECK_TIME));
-		chip->charger_exist = true;
-		chip->chging_on = true;
-		chip->slave_charger_enable = false;
-		chip->read_by_reg = 0;
-
-		if (chip->hmac == false && chip->external_gauge) {
-			chip->hmac = oplus_gauge_get_batt_hmac();
-			if (oplus_switching_support_parallel_chg() &&
-			    chip->balancing_bat_status == PARALLEL_BAT_BALANCE_ERROR_STATUS8)
-				chip->hmac = false;
-		}
-
-		if (!oplus_chg_show_vooc_logo_ornot() && chip->pre_charger_exist == false) {
-			chip->quick_mode_time = current_kernel_time();
-			chip->start_time = chip->quick_mode_time.tv_sec;
-			chip->quick_mode_gain_time_ms = 0;
-			chip->quick_mode_start_time = 0;
-			chip->quick_mode_stop_time = 0;
-			chip->quick_mode_start_cap = -1;
-			chip->quick_mode_stop_cap = -1;
-			chip->quick_mode_stop_temp = -1;
-			chip->quick_mode_stop_soc = -1;
-		}
-		if (chip->balancing_bat_status != PARALLEL_BAT_BALANCE_ERROR_STATUS8 &&
-		    chip->balancing_bat_status != PARALLEL_BAT_BALANCE_ERROR_STATUS9) {
-			chip->balancing_bat_stop_chg = 0;
-			chip->balancing_bat_status = -1;
-			chip->balancing_bat_stop_fastchg = 0;
-		}
-		oplus_first_enable_adsp_voocphy();
-		oplus_comm_fginfo_reset(chip);
-	} else {
-		chip->check_pd_svooc_complete = false;
-		cancel_delayed_work(&chip->check_pd_svooc_work);
-		// if (oplus_chg_get_voocphy_support() == ADSP_VOOCPHY)
-			oplus_adsp_voocphy_clear_status();
-
-		if (!oplus_chg_show_vooc_logo_ornot()) {
-			if (chip->decimal_control) {
-				cancel_delayed_work_sync(&g_charger_chip->ui_soc_decimal_work);
-				chip->last_decimal_ui_soc = (chip->ui_soc_integer + chip->ui_soc_decimal);
-				oplus_chg_ui_soc_decimal_deinit();
-				pr_err("[oplus_chg_variables_reset]cancel last_decimal_ui_soc:%d",
-				       chip->last_decimal_ui_soc);
-			}
-			chip->calculate_decimal_time = 0;
-			chip->bms_heat_temp_compensation = 0;
-			mutex_lock(&chip->slow_chg_mutex);
-			chip->slow_chg_pct = 0;
-			chip->slow_chg_watt = 0;
-			chip->slow_chg_enable = false;
-			chip->slow_chg_batt_limit = 0;
-			mutex_unlock(&chip->slow_chg_mutex);
-		}
-		if ((chip->mmi_fastchg == 1) && (chip->chg_cycle_status & CHG_CYCLE_VOTER__USER)) {
-			chip->chg_cycle_status &= ~(int)CHG_CYCLE_VOTER__USER;
-			if (!chip->chg_cycle_status) {
-				chip->stop_chg = 1;
-				// if (oplus_chg_get_voocphy_support() == ADSP_VOOCPHY)
-					oplus_adsp_voocphy_turn_on();
-			}
-		}
-		chip->unwakelock_chg = 0;
-		chip->allow_swtich_to_fastchg = 1;
-		chip->charger_exist = false;
-		chip->chging_on = false;
-		chip->charger_type = POWER_SUPPLY_TYPE_UNKNOWN;
-		chip->charger_subtype = CHARGER_SUBTYPE_DEFAULT;
-		chip->real_charger_type = POWER_SUPPLY_TYPE_UNKNOWN;
-		chip->usbtemp_batt_current = 0;
-		chip->usbtemp_pre_batt_current = 0;
-		chip->usbtemp_change_across_unplug = true;
-		vbatt_higherthan_4180mv = false;
-		mcu_update = false;
-		suspend_charger = false;
-		chip->pd_svooc = false;
-		chip->notify_flag = 0;
-		chip->fg_soft_reset_done = true;
-		if (oplus_chg_get_voocphy_support() == AP_SINGLE_CP_VOOCPHY ||
-		    oplus_chg_get_voocphy_support() == AP_DUAL_CP_VOOCPHY) {
-			oplus_voocphy_clear_variables();
-		}
-	}
-	// if (chip->plc_support && chip->mmi_fastchg) {
-	// 	if (chip->charger_exist) {
-	// 		chip->curr_plc_status = PLC_STATUS_DISABLE;
-	// 		chip->plc_status = PLC_STATUS_DISABLE;
-	// 	} else {
-	// 		chip->curr_plc_status = PLC_STATUS_NOT_ALLOW;
-	// 		chip->plc_status = PLC_STATUS_NOT_ALLOW;
-	// 	}
-	// }
-	chip->pre_charger_exist = chip->charger_exist;
-	chip->qc_abnormal_check_count = 0;
-	chip->limits.vbatt_pdqc_to_9v_thr = oplus_get_vbatt_pdqc_to_9v_thr();
-	chip->sw_full_count = 0;
-	chip->sw_full = false;
-	chip->full_data.vbat_counts_hw = 0;
-	chip->full_data.sub_vbat_counts_hw = 0;
-	chip->full_data.hw_full = false;
-	chip->full_data.sub_hw_full = false;
-	chip->full_data.clear_full_check_count = 0;
-	chip->hw_full_by_sw = false;
-	chip->sw_sub_batt_full_count = 0;
-	chip->sw_sub_batt_full = false;
-	chip->hw_sub_batt_full_by_sw = false;
-	chip->vchg_status = CHARGER_STATUS__GOOD;
-	chip->batt_full = false;
-	chip->real_batt_full = false;
-	chip->tbatt_when_full = 200;
-	chip->recharge_after_ffc = false;
-	chip->tbatt_status = BATTERY_STATUS__NORMAL;
-	chip->tbatt_pre_shake = TBATT_PRE_SHAKE_INVALID;
-	chip->tbatt_normal_status = BATTERY_STATUS__NORMAL_PHASE1;
-	chip->tbatt_normal_pre_shake = TBATT_PRE_SHAKE_INVALID;
-	chip->tbatt_cold_status = BATTERY_STATUS__COLD_PHASE1;
-	chip->tbatt_cold_pre_shake = TBATT_PRE_SHAKE_INVALID;
-	chip->low_temp_check_jiffies = jiffies;
-	chip->vbatt_over = 0;
-	chip->total_time = 0;
-	chip->chging_over_time = 0;
-	chip->in_rechging = 0;
-	chip->adsp_notify_ap_suspend = 0;
-	chip->stop_voter = 0x00;
-	chip->charging_state = CHARGING_STATUS_CCCV;
-	chip->pre_chg_up_limit_mmi_val = 0;
-	chip->usb_aicl_enable_flag = false;
-	if (chip->mmi_fastchg == 0) {
-		chip->mmi_chg = 0;
-		// if (oplus_chg_get_voocphy_support() == ADSP_VOOCPHY)
-			oplus_adsp_voocphy_turn_off();
-	} else {
-		if (!in)
-			chip->mmi_chg = 1;
-	}
-	chip->unwakelock_chg = 0;
-	chip->notify_code = 0;
-	chip->check_time_sec = 0;
-	chip->fastchg_check_first_time = true;
-	if (!((chip->charger_type == POWER_SUPPLY_TYPE_USB_DCP) || (oplus_vooc_get_fastchg_started() == true) ||
-	      (oplus_vooc_get_fastchg_to_warm() == true) || (oplus_vooc_get_fastchg_dummy_started() == true) ||
-	      (oplus_vooc_get_adapter_update_status() == ADAPTER_FW_NEED_UPDATE) ||
-	      (oplus_vooc_get_btb_temp_over() == true) || oplus_quirks_keep_connect_status())) {
-		chip->cool_down = 0;
-		chip->cool_down_done = false;
-	}
-	chip->cool_down_force_5v = false;
-	chip->limits.cold_bat_decidegc = chip->anti_shake_bound.cold_bound;
-	chip->limits.freeze_bat_decidegc = chip->anti_shake_bound.freeze_bound;
-	chip->limits.little_cold_bat_decidegc = chip->anti_shake_bound.little_cold_bound;
-	chip->limits.cool_bat_decidegc = chip->anti_shake_bound.cool_bound;
-	chip->limits.little_cool_bat_decidegc = chip->anti_shake_bound.little_cool_bound;
-	chip->limits.normal_bat_decidegc = chip->anti_shake_bound.normal_bound;
-	chip->limits.warm_bat_decidegc = chip->anti_shake_bound.warm_bound;
-	chip->limits.hot_bat_decidegc = chip->anti_shake_bound.hot_bound;
-
-	chip->limits.normal_phase1_bat_decidegc = chip->tbatt_normal_anti_shake_bound.phase1_bound;
-	chip->limits.normal_phase2_bat_decidegc = chip->tbatt_normal_anti_shake_bound.phase2_bound;
-	chip->limits.normal_phase3_bat_decidegc = chip->tbatt_normal_anti_shake_bound.phase3_bound;
-	chip->limits.normal_phase4_bat_decidegc = chip->tbatt_normal_anti_shake_bound.phase4_bound;
-	chip->limits.normal_phase5_bat_decidegc = chip->tbatt_normal_anti_shake_bound.phase5_bound;
-	chip->limits.normal_phase6_bat_decidegc = chip->tbatt_normal_anti_shake_bound.phase6_bound;
-
-	chip->limits.vfloat_over_counts = 0;
-	chip->limits.led_warm_bat_decidegc_antishake = chip->limits.led_warm_bat_decidegc;
-	chip->limits.led_high_bat_decidegc_antishake = chip->limits.led_high_bat_decidegc;
-	chip->led_temp_change = false;
-	chip->limits.vooc_warm_bat_decidegc_antishake = chip->limits.vooc_warm_bat_decidegc;
-	chip->limits.vooc_normal_bat_decidegc_antishake = chip->limits.vooc_normal_bat_decidegc;
-	chip->vooc_temp_change = false;
-	if (chip->temperature > chip->limits.led_high_bat_decidegc) {
-		chip->led_temp_status = LED_TEMP_STATUS__HIGH;
-	} else if (chip->temperature > chip->limits.led_warm_bat_decidegc) {
-		chip->led_temp_status = LED_TEMP_STATUS__WARM;
-	} else {
-		chip->led_temp_status = LED_TEMP_STATUS__NORMAL;
-	}
-	chip->dod0_counts = 0;
-	chip->fastchg_to_ffc = false;
-	chip->fastchg_ffc_status = 0;
-	chip->chg_ctrl_by_lcd = chip->chg_ctrl_by_lcd_default;
-	chip->chg_ctrl_by_vooc = chip->chg_ctrl_by_vooc_default;
-	chip->ffc_temp_status = FFC_TEMP_STATUS__NORMAL;
-	chip->vooc_temp_status = VOOC_TEMP_STATUS__NORMAL;
-	chip->limits.iterm_ma = chip->limits.default_iterm_ma;
-	chip->limits.sub_iterm_ma = chip->limits.default_sub_iterm_ma;
-	chip->limits.temp_normal_fastchg_current_ma = chip->limits.default_temp_normal_fastchg_current_ma;
-	chip->limits.normal_vfloat_sw_limit = chip->limits.default_normal_vfloat_sw_limit;
-	chip->limits.temp_normal_vfloat_mv = chip->limits.default_temp_normal_vfloat_mv;
-	chip->limits.normal_vfloat_over_sw_limit = chip->limits.default_normal_vfloat_over_sw_limit;
-	chip->limits.temp_little_cool_fastchg_current_ma = chip->limits.default_temp_little_cool_fastchg_current_ma;
-	chip->limits.little_cool_vfloat_sw_limit = chip->limits.default_little_cool_vfloat_sw_limit;
-	chip->limits.temp_little_cool_vfloat_mv = chip->limits.default_temp_little_cool_vfloat_mv;
-	chip->limits.little_cool_vfloat_over_sw_limit = chip->limits.default_little_cool_vfloat_over_sw_limit;
-	chip->limits.temp_little_cool_fastchg_current_ma_high =
-		chip->limits.default_temp_little_cool_fastchg_current_ma_high;
-	chip->limits.temp_little_cool_fastchg_current_ma_low =
-		chip->limits.default_temp_little_cool_fastchg_current_ma_low;
-	chip->limits.temp_little_cold_fastchg_current_ma_high =
-		chip->limits.default_temp_little_cold_fastchg_current_ma_high;
-	chip->limits.temp_little_cold_fastchg_current_ma_low =
-		chip->limits.default_temp_little_cold_fastchg_current_ma_low;
-	chip->limits.temp_cold_fastchg_current_ma_high = chip->limits.default_temp_cold_fastchg_current_ma_high;
-	chip->limits.temp_cold_fastchg_current_ma_low = chip->limits.default_temp_cold_fastchg_current_ma_low;
-	chip->limits.temp_cool_fastchg_current_ma_high = chip->limits.default_temp_cool_fastchg_current_ma_high;
-	chip->limits.temp_cool_fastchg_current_ma_low = chip->limits.default_temp_cool_fastchg_current_ma_low;
-	chip->limits.temp_warm_fastchg_current_ma = chip->limits.default_temp_warm_fastchg_current_ma;
-	chip->limits.input_current_charger_ma = chip->limits.default_input_current_charger_ma;
-	chip->limits.input_current_vooc_ma_high = chip->limits.default_input_current_vooc_ma_high;
-	chip->limits.input_current_vooc_ma_warm = chip->limits.default_input_current_vooc_ma_warm;
-	chip->limits.input_current_vooc_ma_normal = chip->limits.default_input_current_vooc_ma_normal;
-	chip->limits.pd_input_current_charger_ma = chip->limits.default_pd_input_current_charger_ma;
-	chip->limits.qc_input_current_charger_ma = chip->limits.default_qc_input_current_charger_ma;
-	oplus_chg_aging_ffc_variable_reset(chip);
-	reset_mcu_delay = 0;
-	efttest_count = 1;
-	high_vol_light = 0;
-	chip->pmic_spmi.aicl_suspend = false;
-	oplus_chg_battery_authenticate_check(chip);
-	chip->chargerid_volt = 0;
-	chip->chargerid_volt_got = false;
-	chip->short_c_batt.in_idle = true; /* defualt in idle for userspace */
-	chip->short_c_batt.cv_satus = false; /* defualt not in cv chg */
-	chip->short_c_batt.disable_rechg = false;
-	chip->short_c_batt.limit_chg = false;
-	chip->short_c_batt.limit_rechg = false;
-	chip->chg_ctrl_by_cool_down = false;
-	chip->smart_charge_user = SMART_CHARGE_USER_OTHER;
-	chip->usbtemp_cool_down = 0;
-	chip->pd_chging = false;
-	chip->pps_to_pd_chging = false;
-	chip->pd_wait_svid = true;
-	chip->vooc_start_fail = false;
-	for (i = 0; i < ARRAY_SIZE(chip->ibat_save); i++)
-		chip->ibat_save[i] = 500;
-	chip->pd_wait_svid = true;
-	chg_ctrl_by_sale_mode = false;
-	chip->pd_adapter_support_9v = true;
-	chip->vooc_start_fail = false;
-	chip->cool_down_check_done = false;
-	chip->pd_authentication = -ENODATA;
-	chip->pps_force_svooc = false;
-	chip->usbtemp_curr_status = 0;
-	oplus_pps_variables_reset(in);
-	chip->bcc_cool_down = 0;
-	chip->bcc_curr_done = BCC_CURR_DONE_UNKNOW;
-	chip->limits.force_input_current_ma = 0;
-	chip->batt_target_curr = 0;
-	chip->pre_charging_current = 0;
-	chip->aicl_done = false;
-	if (oplus_switching_support_parallel_chg() == PARALLEL_MOS_CTRL) {
-		oplus_chg_parellel_variables_reset();
-		oplus_init_parallel_temp_threshold();
-	}
-	chip->parallel_error_flag &= ~(REASON_SOC_NOT_FULL);
-	chip->soc_not_full_report = false;
-	chip->voocphy_notify_ap_suspend = false;
-	chg_err("charger detect is %d\n", in);
-}
 
 
 
@@ -770,100 +777,6 @@ int oplus_chg_set_pd_config(struct battery_chg_dev *bcdev)
 
 
 #define UNKNOW_TYPE_DETECT_RETRY_TIME 2
-void oplus_charger_detect_check(struct battery_chg_dev *bcdev)
-{
-	struct voocphy_manager *vooc = bcdev->vooc_chip;
-	static bool charger_resumed = true;
-	static int unknow_type_check = 0;
-
-	if (oplus_chg_is_usb_present(bcdev)) {
-		// oplus_chg_set_awake(chip, true);
-		// if (chip->wireless_support && (oplus_wpc_get_fw_updating() || oplus_chg_is_wls_fw_upgrading())) {
-		// 	return;
-		// }
-
-		// if (oplus_switching_support_parallel_chg() == PARALLEL_MOS_CTRL)
-		// 	parallel_chg_check_balance_bat_status();
-
-		if (chip->charger_type == POWER_SUPPLY_TYPE_UNKNOWN) {
-			// noplug_temperature = oplus_get_report_batt_temp();
-			// noplug_batt_volt_max = chip->batt_volt_max;
-			// noplug_batt_volt_min = chip->batt_volt_min;
-			oplus_chg_variables_reset(chip, true);
-			oplus_charger_dec_cv_check(chip);
-
-			chip->charger_type = opchg_get_charger_type(bcdev);
-
-			charger_xlog_printk(CHG_LOG_CRTI, "Charger in 1 charger_type=%d, unknow_type_check[%d]\n",
-					    chip->charger_type, unknow_type_check);
-			if (chip->charger_type == POWER_SUPPLY_TYPE_UNKNOWN)
-				unknow_type_check++;
-			else
-				unknow_type_check = 0;
-
-			if (unknow_type_check >= UNKNOW_TYPE_DETECT_RETRY_TIME && (vooc->fastchg_dummy_started == true ||
-			     vooc->fastchg_to_normal == true || vooc->fastchg_to_warm == true || vooc->btb_temp_over == true))
-				chip->charger_type = POWER_SUPPLY_TYPE_USB_DCP;
-
-			if (vooc->fastchg_dummy_started == true &&
-				  vooc->reset_adapter  == true) {
-				charger_xlog_printk(CHG_LOG_CRTI, "dummy_start is true,don't turn on charge here\n");
-				oplus_chg_turn_on_charging(chip);
-				oplus_chg_switch(chip);
-			} else if (oplus_wpc_get_wireless_charge_start() == false && !oplus_chg_is_wls_present()) {
-				charger_xlog_printk(CHG_LOG_CRTI, "oplus_wpc_get_wireless_charge_start == false\n");
-				charger_resumed = true;
-				oplus_chg_turn_on_charging(chip);
-				oplus_chg_switch(chip);
-			} else
-				oplus_chg_switch(chip);
-			// if (oplus_switching_support_parallel_chg() == PARALLEL_MOS_CTRL &&
-			//     oplus_support_normal_batt_spec_check()) {
-			// 	chip->batt_target_curr = 0;
-			// 	chip->pre_charging_current = 0;
-			// 	oplus_chg_parellel_variables_reset();
-			// 	schedule_delayed_work(&chip->parallel_batt_chg_check_work,
-			// 			      OPLUS_CHG_UPDATE_INTERVAL(PARALLEL_CHECK_TIME));
-			// }
-		} else {
-			if (vooc->fastchg_started == false && charger_resumed == false) {
-				charger_resumed = true;
-				// if (oplus_vooc_get_reply_bits() == 7) {
-				// 	oplus_chg_switch(chip);
-				// 	oplus_chg_turn_on_charging(chip);
-				// } else {
-					oplus_chg_turn_on_charging(chip);
-					oplus_chg_switch(chip);
-				// }
-
-			} else
-				oplus_chg_switch(chip);
-		}
-		
-	} else {
-		// if (oplus_switching_support_parallel_chg() == PARALLEL_MOS_CTRL) {
-		// 	parallel_chg_check_balance_bat_status();
-		// 	if (oplus_support_normal_batt_spec_check()) {
-		// 		chip->batt_target_curr = 0;
-		// 		chip->pre_charging_current = 0;
-		// 		oplus_chg_parellel_variables_reset();
-		// 		cancel_delayed_work_sync(&chip->parallel_batt_chg_check_work);
-		// 	}
-		// }
-
-		unknow_type_check = 0;
-		oplus_chg_variables_reset(chip, false);
-		if (!chip->mmi_fastchg)
-			oplus_mmi_fastchg_in(chip);
-
-
-		if (chip->chg_ops->get_charging_enable() == true)
-			oplus_chg_turn_off_charging(chip);
-
-		// oplus_chg_set_awake(chip, false);
-
-	}
-}
 
 static void oplus_chg_update_work(struct battery_chg_dev *bcdev)
 {
@@ -1369,6 +1282,16 @@ static int battery_get_property(struct power_supply *psy,
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	int ret;
 
+	if (battmgr->charge_limit_supported &&
+	    (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	     psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)) {
+		mutex_lock(&battmgr->lock);
+		val->intval = psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ?
+			battmgr->charge_limit.start : battmgr->charge_limit.end;
+		mutex_unlock(&battmgr->lock);
+		return 0;
+	}
+
 	if (!battmgr->service_up)
 		return -EAGAIN;
 
@@ -1379,6 +1302,14 @@ static int battery_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
+		if (battmgr->charge_limit_supported) {
+			mutex_lock(&battmgr->lock);
+			if ((battmgr->usb.online || battmgr->wireless.online) &&
+			    battmgr->charge_limit_applied_valid && battmgr->charge_limit_applied &&
+			    battmgr->charge_limit_generation == READ_ONCE(battmgr->service_generation))
+				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+			mutex_unlock(&battmgr->lock);
+		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
@@ -1409,6 +1340,8 @@ static int battery_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		val->intval = battmgr->status.current_now;
+		if (battmgr->invert_current)
+			val->intval = -val->intval;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		val->intval = battmgr->bcdev->curr_thermal_level;
@@ -1500,6 +1433,11 @@ static int battery_set_prop(struct power_supply *psy,
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 
+	if (battmgr->charge_limit_supported &&
+	    (psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	     psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD))
+		return oplus_battmgr_negroni_set_threshold(battmgr, psp, pval->intval);
+
 	if (!battmgr->service_up)
 		return -EAGAIN;
 
@@ -1516,6 +1454,12 @@ static int battery_set_prop(struct power_supply *psy,
 static int battery_prop_is_writeable(struct power_supply *psy,
 		enum power_supply_property prop)
 {
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+
+	if (prop == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	    prop == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD)
+		return battmgr->charge_limit_supported;
+
 	switch (prop) {
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		return 1;
@@ -1565,6 +1509,47 @@ static const struct power_supply_desc battery_psy_desc = {
 	.property_is_writeable	= battery_prop_is_writeable,
 };
 
+static enum power_supply_property negroni_battery_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_CHARGE_TYPE,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TECHNOLOGY,
+	POWER_SUPPLY_PROP_CHARGE_COUNTER,
+	POWER_SUPPLY_PROP_CYCLE_COUNT,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CHARGE_FULL,
+	POWER_SUPPLY_PROP_MODEL_NAME,
+	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
+	POWER_SUPPLY_PROP_TIME_TO_FULL_NOW,
+	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
+	POWER_SUPPLY_PROP_POWER_NOW,
+	POWER_SUPPLY_PROP_POWER_AVG,
+	POWER_SUPPLY_PROP_CHARGE_NOW,
+	POWER_SUPPLY_PROP_VOLTAGE_MIN,
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+};
+
+static const struct power_supply_desc negroni_battery_psy_desc = {
+	.name = "battery",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = negroni_battery_props,
+	.num_properties = ARRAY_SIZE(negroni_battery_props),
+	.get_property = battery_get_property,
+	.set_property		= battery_set_prop,
+	.property_is_writeable	= battery_prop_is_writeable,
+};
+
 static const u8 usb_prop_map[USB_PROP_MAX] = {
 	[POWER_SUPPLY_PROP_ONLINE] = USB_ONLINE,
 	[POWER_SUPPLY_PROP_VOLTAGE_NOW] = USB_VOLT_NOW,
@@ -1605,7 +1590,7 @@ static int oplus_battmgr_usb_update(struct qcom_battmgr *battmgr,
 
 	prop = usb_prop_map[psp];
 
-	return oplus_battmgr_request_property(battmgr, BC_BATTERY_STATUS_GET, prop, 0);
+	return oplus_battmgr_request_property(battmgr, BC_USB_STATUS_GET, prop, 0);
 }
 
 static int usb_get_property(struct power_supply *psy,
@@ -1797,6 +1782,38 @@ static const struct power_supply_desc adsp_wls_psy_desc = {
 	.get_property = wls_get_property,
 };
 
+/* GLINK callbacks must not wait for replies on their own receive path. */
+static void oplus_battmgr_notification_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr,
+						 notification_work);
+	struct battery_chg_dev *bcdev = battmgr->bcdev;
+	unsigned long pending;
+
+	while (!READ_ONCE(battmgr->stopping) &&
+	       (pending = xchg(&battmgr->pending_notifications, 0))) {
+		if (pending & BIT(0)) {
+			bcdev->adsp_voocphy_err_check = true;
+			if (bcdev->vooc_chip)
+				bcdev->vooc_chip->adspvoocphy_fastchg_start = true;
+			cancel_delayed_work_sync(&bcdev->adsp_voocphy_err_work);
+			schedule_delayed_work(&bcdev->adsp_voocphy_err_work,
+					      msecs_to_jiffies(8500));
+			smbchg_charging_disable(battmgr);
+			smbchg_usb_suspend_enable(battmgr);
+		}
+		if (pending & BIT(1)) {
+			int type = opchg_get_charger_type(bcdev);
+			int subtype = oplus_chg_get_charger_subtype(bcdev);
+
+			bcdev->real_chg_type = type | (subtype << 8);
+			bcdev->hvdcp_detect_ok = true;
+		}
+		if (pending & BIT(2))
+			smbchg_usb_suspend_disable(battmgr);
+	}
+}
+
 static void oplus_battmgr_notification(struct qcom_battmgr *battmgr,
 				      const struct qcom_battmgr_message *msg,
 				      int len)
@@ -1805,9 +1822,6 @@ static void oplus_battmgr_notification(struct qcom_battmgr *battmgr,
 	size_t payload_len = len - sizeof(struct pmic_glink_hdr);
 	unsigned int notification;
 
-	int chg_type;
-	int sub_chg_type;
-
 	if (payload_len != sizeof(msg->notification)) {
 		dev_warn(battmgr->dev, "ignoring notification with invalid length\n");
 		return;
@@ -1815,6 +1829,12 @@ static void oplus_battmgr_notification(struct qcom_battmgr *battmgr,
 
 	notification = le32_to_cpu(msg->notification);
 	notification &= 0xff;
+	if (battmgr->charge_limit_supported && READ_ONCE(battmgr->charge_limit.enabled) &&
+	    (notification == BC_PLUGIN_IRQ || notification == BC_TYPEC_STATE_CHANGE ||
+	     notification == BC_VOOC_VBUS_ADC_ENABLE || notification == BC_CHG_STATUS_SET)) {
+		WRITE_ONCE(battmgr->service_generation, battmgr->service_generation + 1);
+		mod_delayed_work(system_wq, &battmgr->charge_limit_work, msecs_to_jiffies(500));
+	}
 	switch (notification) {
 	case BC_BATTERY_STATUS_GET:
 	case BC_GENERIC_NOTIFY:
@@ -1863,23 +1883,16 @@ static void oplus_battmgr_notification(struct qcom_battmgr *battmgr,
 		// schedule_delayed_work(&bcdev->adsp_track_notify_work, 0);
 		break;
 	case BC_VOOC_VBUS_ADC_ENABLE:
-		printk(KERN_ERR "!!!!!vooc_vbus_adc_enable\n");
-		bcdev->adsp_voocphy_err_check = true;
-		bcdev->vooc_chip.adspvoocphy_fastchg_start = true;
-		cancel_delayed_work_sync(&bcdev->adsp_voocphy_err_work);
-		schedule_delayed_work(&bcdev->adsp_voocphy_err_work, msecs_to_jiffies(8500));
-		smbchg_charging_disable(battmgr);
-		smbchg_usb_suspend_enable(battmgr);/*excute in glink loop for real time*/
+		set_bit(0, &battmgr->pending_notifications);
+		schedule_work(&battmgr->notification_work);
 		break;
 	case BC_CID_DETECT:
 		printk(KERN_ERR "!!!!!cid detect || no detect\n");
 		// schedule_delayed_work(&bcdev->cid_status_change_work, 0);
 		break;
 	case BC_QC_DETECT:
-		chg_type = opchg_get_charger_type(bcdev);
-		sub_chg_type = oplus_chg_get_charger_subtype(bcdev);
-		bcdev->real_chg_type = chg_type | (sub_chg_type << 8);
-		bcdev->hvdcp_detect_ok = true;
+		set_bit(1, &battmgr->pending_notifications);
+		schedule_work(&battmgr->notification_work);
 		break;
 	case BC_TYPEC_STATE_CHANGE:
 		printk(KERN_ERR "!!!!!typec_state_change_work\n");
@@ -1899,6 +1912,7 @@ static void oplus_battmgr_notification(struct qcom_battmgr *battmgr,
 	case BC_ADSP_NOTIFY_AP_SUSPEND_CHG:
 		printk(KERN_ERR "!!!!!oplus_apsd_notify_ap_suspend_chg\n");
 		bcdev->chip->adsp_notify_ap_suspend = true;
+		WRITE_ONCE(battmgr->adsp_suspended_chg, true);
 		// oplus_chg_set_adsp_notify_ap_suspend();
 		break;
 	case BC_PD_SOFT_RESET:
@@ -1908,7 +1922,8 @@ static void oplus_battmgr_notification(struct qcom_battmgr *battmgr,
 		// schedule_delayed_work(&bcdev->pd_set_aicl_work, 0);
 		break;
 	case BC_CHG_STATUS_SET:
-		smbchg_usb_suspend_disable(battmgr);
+		set_bit(2, &battmgr->pending_notifications);
+		schedule_work(&battmgr->notification_work);
 		break;
 	case BC_ADSP_NOTIFY_AP_CP_BYPASS_INIT:
 		printk(KERN_ERR "!!!!!BC_ADSP_NOTIFY_AP_CP_BYPASS_INIT\n");
@@ -1956,6 +1971,16 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 		return;
 	}
 
+	if (battmgr->charge_limit_supported) {
+		if (opcode != READ_ONCE(battmgr->pending_opcode))
+			return;
+		if ((opcode == BC_BATTERY_STATUS_GET || opcode == BC_USB_STATUS_GET ||
+		     opcode == BC_WLS_STATUS_GET || opcode == BC_BATTERY_STATUS_SET ||
+		     opcode == BC_USB_STATUS_SET || opcode == BC_WLS_STATUS_SET) &&
+		    le32_to_cpu(resp->intval.property) != READ_ONCE(battmgr->pending_property))
+			return;
+	}
+
 	switch (opcode) {
 	case BC_BATTERY_STATUS_GET:
 		property = le32_to_cpu(resp->intval.property);
@@ -1965,7 +1990,7 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 					 "invalid payload length for BATT_MODEL_NAME request: %zd\n",
 					 payload_len);
 				battmgr->error = -ENODATA;
-				return;
+				goto out_complete;
 			}
 		} else {
 			if (payload_len != sizeof(resp->intval)) {
@@ -1973,7 +1998,7 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 					 "invalid payload length for %#x request: %zd\n",
 					 property, payload_len);
 				battmgr->error = -ENODATA;
-				return;
+				goto out_complete;
 			}
 
 			battmgr->error = le32_to_cpu(resp->intval.result);
@@ -1995,6 +2020,7 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 			battmgr->info.charge_type = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_CAPACITY:
+			battmgr->charge_limit_soc_raw = le32_to_cpu(resp->intval.value);
 			battmgr->status.percent = le32_to_cpu(resp->intval.value) / 100;
 			break;
 		case BATT_SOH:
@@ -2020,7 +2046,7 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 			break;
 		case BATT_TEMP:
 			val = le32_to_cpu(resp->intval.value);
-			battmgr->status.temperature = DIV_ROUND_CLOSEST(val, 10);
+			battmgr->status.temperature = val;
 			break;
 		case BATT_TECHNOLOGY:
 			battmgr->info.technology = le32_to_cpu(resp->intval.value);
@@ -2062,12 +2088,14 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 		break;
 	case BC_USB_STATUS_GET:
 		property = le32_to_cpu(resp->intval.property);
+		if (battmgr->charge_limit_supported)
+			property = oplus_battmgr_usb_logical_property(property);
 		if (payload_len != sizeof(resp->intval)) {
 			dev_warn(battmgr->dev,
 				 "invalid payload length for %#x request: %zd\n",
 				 property, payload_len);
 			battmgr->error = -ENODATA;
-			return;
+			goto out_complete;
 		}
 
 		battmgr->error = le32_to_cpu(resp->intval.result);
@@ -2077,6 +2105,10 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 		switch (property) {
 		case USB_ONLINE:
 			battmgr->usb.online = le32_to_cpu(resp->intval.value);
+			if (!battmgr->usb.online) {
+				WRITE_ONCE(battmgr->adsp_suspended_chg, false);
+				bcdev->chip->adsp_notify_ap_suspend = false;
+			}
 			break;
 		case USB_VOLT_NOW:
 			battmgr->usb.voltage_now = le32_to_cpu(resp->intval.value);
@@ -2120,7 +2152,7 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 				 "invalid payload length for %#x request: %zd\n",
 				 property, payload_len);
 			battmgr->error = -ENODATA;
-			return;
+			goto out_complete;
 		}
 
 		battmgr->error = le32_to_cpu(resp->intval.result);
@@ -2151,6 +2183,10 @@ static void battmgr_callback(struct qcom_battmgr *battmgr,
 	case BC_BATTERY_STATUS_SET:
 	case BC_USB_STATUS_SET:
 	case BC_WLS_STATUS_SET:
+		if (payload_len != sizeof(resp->intval)) {
+			battmgr->error = -ENODATA;
+			goto out_complete;
+		}
 		property = le32_to_cpu(resp->intval.property);
 		battmgr->error = le32_to_cpu(resp->intval.result);
 		dev_dbg(battmgr->dev, "property set resopnse: opcode: 0x%x, property: %u, result: %u\n", opcode, property, battmgr->error);
@@ -2173,12 +2209,20 @@ static void oplus_battmgr_callback(const void *data, size_t len, void *priv)
 {
 	const struct pmic_glink_hdr *hdr = data;
 	struct qcom_battmgr *battmgr = priv;
-	unsigned int opcode = le32_to_cpu(hdr->opcode);
+	unsigned int opcode;
+	unsigned long flags;
 
-	if (opcode == BC_NOTIFY_IND)
-		oplus_battmgr_notification(battmgr, data, len);
-	else
+	if (len < sizeof(*hdr))
+		return;
+	opcode = le32_to_cpu(hdr->opcode);
+	if (opcode == BC_NOTIFY_IND) {
+		spin_lock_irqsave(&battmgr->event_lock, flags);
+		if (!READ_ONCE(battmgr->stopping))
+			oplus_battmgr_notification(battmgr, data, len);
+		spin_unlock_irqrestore(&battmgr->event_lock, flags);
+	} else {
 		battmgr_callback(battmgr, data, len);
+	}
 }
 
 static void oplus_battmgr_enable_worker(struct work_struct *work)
@@ -2191,7 +2235,16 @@ static void oplus_battmgr_enable_worker(struct work_struct *work)
 	};
 	int ret;
 
+	mutex_lock(&battmgr->lock);
+	if (battmgr->charge_limit_supported) {
+		battmgr->gauge_init_done = false;
+		battmgr->bcdev->chg_en = false;
+		battmgr->charge_limit_applied_valid = false;
+		if (battmgr->charge_limit.enabled)
+			battmgr->charge_limit.cutoff = true;
+	}
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
+	mutex_unlock(&battmgr->lock);
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
 
@@ -2201,17 +2254,25 @@ static void oplus_battmgr_enable_worker(struct work_struct *work)
 static void oplus_adsp_crash_recover_func(struct work_struct *work)
 {
 	struct battery_chg_dev *bcdev = container_of(work, struct battery_chg_dev, adsp_crash_recover_work.work);
+	struct qcom_battmgr *battmgr = bcdev->battmgr;
 	struct oplus_chg_chip *chip = bcdev->chip;
+	int ret;
+
+	if (READ_ONCE(battmgr->stopping) || !READ_ONCE(battmgr->service_up))
+		return;
 
 	if (!chip) {
 		printk(KERN_ERR "!!!chip null\n");
 		return;
 	}
 
-	// if (chip->voocphy_support == ADSP_VOOCPHY) {
-		oplus_ap_init_adsp_gague(bcdev->battmgr);
-		// oplus_adsp_voocphy_reset_status_when_crash_recover();
-	// }
+	ret = oplus_ap_init_adsp_gague(battmgr);
+	if (ret) {
+		if (!READ_ONCE(battmgr->stopping) && READ_ONCE(battmgr->service_up))
+			mod_delayed_work(system_wq, &bcdev->adsp_crash_recover_work,
+					 msecs_to_jiffies(5000));
+		return;
+	}
 	chip->charger_type  = POWER_SUPPLY_TYPE_UNKNOWN;
 	// if (chip->voocphy_support == ADSP_VOOCPHY)
 		oplus_adsp_voocphy_enable(bcdev->battmgr, true);
@@ -2235,6 +2296,46 @@ static const struct of_device_id oplus_battmgr_of_variants[] = {
 
 static char *oplus_battmgr_battery[] = { "battery" };
 
+static void oplus_battmgr_stop_workers(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+	struct battery_chg_dev *bcdev = battmgr->bcdev;
+	unsigned long flags;
+
+	/* Keep the GLINK client and power supplies alive until waiters finish. */
+	spin_lock_irqsave(&battmgr->event_lock, flags);
+	WRITE_ONCE(battmgr->stopping, true);
+	spin_unlock_irqrestore(&battmgr->event_lock, flags);
+	/* Drain sysfs policy writes that passed the stopping check. */
+	mutex_lock(&battmgr->lock);
+	mutex_unlock(&battmgr->lock);
+	cancel_work_sync(&battmgr->enable_work);
+	cancel_work_sync(&battmgr->notification_work);
+	cancel_delayed_work_sync(&bcdev->adsp_crash_recover_work);
+	cancel_delayed_work_sync(&bcdev->plugin_irq_work);
+	cancel_delayed_work_sync(&bcdev->usb_type_work);
+	cancel_delayed_work_sync(&bcdev->chg_status_send_work);
+	cancel_delayed_work_sync(&bcdev->otg_init_work);
+	cancel_delayed_work_sync(&bcdev->otg_vbus_enable_work);
+	cancel_delayed_work_sync(&bcdev->adsp_voocphy_err_work);
+	cancel_delayed_work_sync(&bcdev->chip->check_pd_svooc_work);
+	/* Gauge recovery may have passed its stopping check before teardown. */
+	cancel_delayed_work_sync(&battmgr->charge_limit_work);
+}
+
+static int oplus_battmgr_prepare(struct device *dev)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	/* ADSP has no verified autonomous SOC threshold while AP is suspended. */
+	return battmgr->charge_limit_supported && READ_ONCE(battmgr->charge_limit.enabled) ?
+		-EBUSY : 0;
+}
+
+static const struct dev_pm_ops oplus_battmgr_pm_ops = {
+	.prepare = oplus_battmgr_prepare,
+};
+
 static int oplus_battmgr_probe(struct auxiliary_device *adev,
 			      const struct auxiliary_device_id *id)
 {
@@ -2252,6 +2353,15 @@ static int oplus_battmgr_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	battmgr->dev = dev;
+	dev_set_drvdata(dev, battmgr);
+	battmgr->invert_current = of_machine_is_compatible("oplus,negroni");
+	battmgr->charge_limit_supported = battmgr->invert_current;
+	battmgr->charge_limit.start = 75;
+	battmgr->charge_limit.end = 80;
+	battmgr->charge_limit_soc_raw = ~0U;
+	battmgr->charge_limit_applied_valid = true;
+	INIT_DELAYED_WORK(&battmgr->charge_limit_work, oplus_battmgr_charge_limit_worker);
+	INIT_WORK(&battmgr->notification_work, oplus_battmgr_notification_worker);
 
 	bcdev = devm_kzalloc(dev, sizeof(*bcdev), GFP_KERNEL);
 	if (!bcdev)
@@ -2273,6 +2383,7 @@ static int oplus_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	mutex_init(&battmgr->lock);
+	spin_lock_init(&battmgr->event_lock);
 	init_completion(&battmgr->ack);
 
 	// INIT_DELAYED_WORK(&bcdev->typec_state_change_work, oplus_typec_state_change_work);
@@ -2321,7 +2432,7 @@ static int oplus_battmgr_probe(struct auxiliary_device *adev,
 	// INIT_DELAYED_WORK(&bcdev->source_pdo_check_work, oplus_source_pdo_check_work);
 	// INIT_DELAYED_WORK(&bcdev->vchg_trig_work, oplus_vchg_trig_work);
 	// INIT_DELAYED_WORK(&bcdev->adsp_track_notify_work, adsp_track_notification_handler);
-	INIT_DELAYED_WORK(&chip->check_pd_svooc_work, oplus_chg_check_pd_svooc_work);
+	INIT_DELAYED_WORK(&bcdev->chip->check_pd_svooc_work, oplus_chg_check_pd_svooc_work);
 
 
 	match = of_match_device(oplus_battmgr_of_variants, dev->parent);
@@ -2338,7 +2449,13 @@ static int oplus_battmgr_probe(struct auxiliary_device *adev,
 	// 	return dev_err_probe(dev, ret,
 	// 			     "failed to init battery charge control thresholds\n");
 
-	battmgr->bat_psy = devm_power_supply_register(dev, &battery_psy_desc, &psy_cfg);
+	if (battmgr->charge_limit_supported) {
+		psy_cfg.attr_grp = oplus_battmgr_negroni_groups;
+		psy_desc = &negroni_battery_psy_desc;
+	} else {
+		psy_desc = &battery_psy_desc;
+	}
+	battmgr->bat_psy = devm_power_supply_register(dev, psy_desc, &psy_cfg);
 	if (IS_ERR(battmgr->bat_psy))
 		return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
 				     "failed to register battery power supply\n");
@@ -2370,6 +2487,9 @@ static int oplus_battmgr_probe(struct auxiliary_device *adev,
 	if (IS_ERR(battmgr->client))
 		return PTR_ERR(battmgr->client);
 
+	ret = devm_add_action_or_reset(dev, oplus_battmgr_stop_workers, battmgr);
+	if (ret)
+		return ret;
 	pmic_glink_client_register(battmgr->client);
 
 	return 0;
@@ -2385,6 +2505,7 @@ static struct auxiliary_driver oplus_battmgr_driver = {
 	.name = "oplus_pmic_glink_power_supply",
 	.probe = oplus_battmgr_probe,
 	.id_table = oplus_battmgr_id_table,
+	.driver.pm = &oplus_battmgr_pm_ops,
 };
 
 module_auxiliary_driver(oplus_battmgr_driver);

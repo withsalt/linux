@@ -133,9 +133,14 @@ struct qcom_battmgr_charge_ctrl_request {
 
 int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 {
+	const struct pmic_glink_hdr *hdr = data;
 	unsigned long left;
 	int ret;
 
+	if (battmgr->charge_limit_supported &&
+	    (READ_ONCE(battmgr->stopping) || !READ_ONCE(battmgr->service_up)))
+		return -EAGAIN;
+	WRITE_ONCE(battmgr->pending_opcode, le32_to_cpu(hdr->opcode));
 	reinit_completion(&battmgr->ack);
 
 	battmgr->error = 0;
@@ -148,7 +153,8 @@ int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
 	if (!left)
 		return -ETIMEDOUT;
 
-	return battmgr->error;
+	/* Oplus firmware errors are positive values, not Linux errnos. */
+	return battmgr->error > 0 ? -EREMOTEIO : battmgr->error;
 }
 EXPORT_SYMBOL_GPL(qcom_battmgr_request);
 
@@ -164,6 +170,7 @@ int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
 		.value = cpu_to_le32(value),
 	};
 
+	WRITE_ONCE(battmgr->pending_property, property);
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
 }
 EXPORT_SYMBOL_GPL(qcom_battmgr_request_property);
@@ -1400,13 +1407,20 @@ EXPORT_SYMBOL_GPL(qcom_battmgr_enable_worker);
 void qcom_battmgr_pdr_notify(void *priv, int state)
 {
 	struct qcom_battmgr *battmgr = priv;
+	unsigned long flags;
 
+	spin_lock_irqsave(&battmgr->event_lock, flags);
+	if (READ_ONCE(battmgr->stopping))
+		goto out;
 	if (state == SERVREG_SERVICE_STATE_UP) {
 		battmgr->service_up = true;
 		schedule_work(&battmgr->enable_work);
 	} else {
-		battmgr->service_up = false;
+		WRITE_ONCE(battmgr->service_up, false);
+		WRITE_ONCE(battmgr->service_generation, battmgr->service_generation + 1);
 	}
+out:
+	spin_unlock_irqrestore(&battmgr->event_lock, flags);
 }
 EXPORT_SYMBOL_GPL(qcom_battmgr_pdr_notify);
 
@@ -1449,6 +1463,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	mutex_init(&battmgr->lock);
+	spin_lock_init(&battmgr->event_lock);
 	init_completion(&battmgr->ack);
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);

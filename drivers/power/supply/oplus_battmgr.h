@@ -901,8 +901,7 @@ struct battery_chg_dev {
 	int real_chg_type;
 
 	bool adsp_voocphy_err_check;
-	struct mutex chg_en_lock;
-	bool chg_en;
+	bool chg_en; /* Effective charging command, protected by battmgr->lock. */
 	bool cid_status;
 	bool force_svooc;
 
