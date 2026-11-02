@@ -134,6 +134,23 @@ int dwc3_host_init(struct dwc3 *dwc)
 	struct platform_device	*xhci;
 	int			ret, irq;
 	int			prop_idx = 0;
+	int			i;
+
+	/*
+	 * A PHY may need to restore clocks and reset its hardware on a role
+	 * change. Finish this before registering xHCI, whose probe can run
+	 * asynchronously and start transfers as soon as the device is added.
+	 */
+	for (i = 0; i < dwc->num_usb2_ports; i++) {
+		ret = phy_set_mode(dwc->usb2_generic_phy[i], PHY_MODE_USB_HOST);
+		if (ret)
+			return ret;
+	}
+	for (i = 0; i < dwc->num_usb3_ports; i++) {
+		ret = phy_set_mode(dwc->usb3_generic_phy[i], PHY_MODE_USB_HOST);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Some platforms need to power off all Root hub ports immediately after DWC3 set to host
@@ -219,12 +236,17 @@ int dwc3_host_init(struct dwc3 *dwc)
 	return 0;
 err:
 	platform_device_put(xhci);
+	dwc->xhci = NULL;
 	return ret;
 }
 EXPORT_SYMBOL_GPL(dwc3_host_init);
 
 void dwc3_host_exit(struct dwc3 *dwc)
 {
+	/* Host initialization can fail before the xHCI device is registered. */
+	if (!dwc->xhci)
+		return;
+
 	if (dwc->sys_wakeup)
 		device_init_wakeup(&dwc->xhci->dev, false);
 
