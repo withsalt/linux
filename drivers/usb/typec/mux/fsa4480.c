@@ -93,12 +93,13 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		sel = FSA4480_SEL_USB;
 	} else if (fsa->svid) {
 		switch (fsa->mode) {
-		/* DP Only */
+		/* Four DP lanes still leave the USB2 D+/D- pair available. */
 		case TYPEC_DP_STATE_C:
 		case TYPEC_DP_STATE_E:
-			enable |= FSA4480_ENABLE_SBU;
+			enable |= FSA4480_ENABLE_USB | FSA4480_ENABLE_SBU;
+			sel = FSA4480_SEL_USB;
 			if (reverse)
-				sel = FSA4480_SEL_SBU_REVERSE;
+				sel |= FSA4480_SEL_SBU_REVERSE;
 			break;
 
 		/* DP + USB */
