@@ -10,6 +10,7 @@
 #include <linux/nvmem-consumer.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/of_device.h>
 #include <linux/of.h>
 #include <linux/pm.h>
@@ -48,9 +49,23 @@ static int oplus_battmgr_request_property_locked(struct qcom_battmgr *battmgr,
 {
 	unsigned int generation = READ_ONCE(battmgr->service_generation);
 	int wire_property = property;
+	bool vooc_enable_requested = opcode == BC_USB_STATUS_SET &&
+				     property == USB_VOOCPHY_ENABLE && value;
 	int ret;
 
 	lockdep_assert_held(&battmgr->lock);
+	if (battmgr->charge_limit_supported && vooc_enable_requested) {
+		/* VOOC claims D+/D-. Only a dedicated charger may start it. */
+		ret = qcom_battmgr_request_property(battmgr, BC_USB_STATUS_GET,
+						   USB_ADAP_TYPE, 0);
+		if (ret)
+			return ret;
+		if (!READ_ONCE(battmgr->service_up) ||
+		    generation != READ_ONCE(battmgr->service_generation))
+			return -EAGAIN;
+		if (battmgr->usb.usb_type != POWER_SUPPLY_USB_TYPE_DCP)
+			value = 0;
+	}
 	if (battmgr->charge_limit_supported) {
 		bool blocked = battmgr->charge_limit.enabled &&
 			       (battmgr->charge_limit.cutoff ||
@@ -77,6 +92,7 @@ static int oplus_battmgr_request_property_locked(struct qcom_battmgr *battmgr,
 	if (battmgr->charge_limit_supported &&
 	    (opcode == BC_USB_STATUS_GET || opcode == BC_USB_STATUS_SET))
 		wire_property = oplus_battmgr_usb_wire_property(property);
+
 	ret = qcom_battmgr_request_property(battmgr, opcode, wire_property, value);
 	if (!ret && battmgr->charge_limit_supported &&
 	    (!READ_ONCE(battmgr->service_up) ||
@@ -88,8 +104,7 @@ static int oplus_battmgr_request_property_locked(struct qcom_battmgr *battmgr,
 		if (ret && battmgr->charge_limit_supported)
 			battmgr->charge_limit_applied_valid = false;
 	}
-	if (battmgr->charge_limit_supported && opcode == BC_USB_STATUS_SET &&
-	    property == USB_VOOCPHY_ENABLE && value)
+	if (battmgr->charge_limit_supported && vooc_enable_requested)
 		battmgr->charge_limit_vooc_disabled = !!ret;
 	return ret;
 }
@@ -319,6 +334,38 @@ static int oplus_battmgr_negroni_set_threshold(struct qcom_battmgr *battmgr,
 	battmgr->charge_limit.end = end;
 	if (battmgr->charge_limit.enabled)
 		mod_delayed_work(system_wq, &battmgr->charge_limit_work, 0);
+out:
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
+static int oplus_battmgr_negroni_usb_fcc(struct qcom_battmgr *battmgr)
+{
+	int ret;
+
+	if (!battmgr->charge_limit_supported)
+		return 0;
+	mutex_lock(&battmgr->lock);
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_USB_STATUS_GET,
+						   USB_ADAP_TYPE, 0);
+	if (ret)
+		goto out;
+	/* Vendor userspace supplies FCC on Android; retain USB's negotiated ICL. */
+	switch (battmgr->usb.usb_type) {
+	case POWER_SUPPLY_USB_TYPE_SDP:
+	case POWER_SUPPLY_USB_TYPE_CDP:
+	case POWER_SUPPLY_USB_TYPE_C:
+	case POWER_SUPPLY_USB_TYPE_PD:
+	case POWER_SUPPLY_USB_TYPE_PD_DRP:
+	case POWER_SUPPLY_USB_TYPE_PD_PPS:
+	case POWER_SUPPLY_USB_TYPE_PD_SDP:
+		ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_SET,
+						   BATT_CHG_CTRL_LIM, 1000000);
+		break;
+	default:
+		/* Dedicated chargers use the independent VOOC current controller. */
+		break;
+	}
 out:
 	mutex_unlock(&battmgr->lock);
 	return ret;
@@ -1032,6 +1079,64 @@ static void otg_notification_handler(struct work_struct *work)
 	}
 }
 
+static void oplus_battmgr_disable_otg(void *data)
+{
+	struct battery_chg_dev *bcdev = data;
+
+	oplus_set_otg_ovp_en_val(bcdev, 0);
+	oplus_set_otg_boost_en_val(bcdev, 0);
+}
+
+static int oplus_battmgr_init_negroni_otg(struct qcom_battmgr *battmgr)
+{
+	struct oplus_custom_gpio_pinctrl *gpio = &battmgr->bcdev->oplus_custom_gpio;
+	struct device *dev = battmgr->dev;
+	struct pinctrl *pinctrl;
+	int ret;
+
+	if (!of_machine_is_compatible("oplus,negroni"))
+		return 0;
+
+	/* The auxiliary device inherits the PMIC GLINK parent's firmware node. */
+	pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR(pinctrl))
+		return dev_err_probe(dev, PTR_ERR(pinctrl), "failed to get OTG pinctrl\n");
+	gpio->otg_boost_en_pinctrl = pinctrl;
+	gpio->otg_ovp_en_pinctrl = pinctrl;
+	gpio->otg_boost_en_active = pinctrl_lookup_state(pinctrl, "otg_booster_en_active");
+	gpio->otg_boost_en_sleep = pinctrl_lookup_state(pinctrl, "otg_booster_en_sleep");
+	gpio->otg_ovp_en_active = pinctrl_lookup_state(pinctrl, "otg_ovp_en_active");
+	gpio->otg_ovp_en_sleep = pinctrl_lookup_state(pinctrl, "otg_ovp_en_sleep");
+	if (IS_ERR(gpio->otg_boost_en_active))
+		return PTR_ERR(gpio->otg_boost_en_active);
+	if (IS_ERR(gpio->otg_boost_en_sleep))
+		return PTR_ERR(gpio->otg_boost_en_sleep);
+	if (IS_ERR(gpio->otg_ovp_en_active))
+		return PTR_ERR(gpio->otg_ovp_en_active);
+	if (IS_ERR(gpio->otg_ovp_en_sleep))
+		return PTR_ERR(gpio->otg_ovp_en_sleep);
+
+	/* Start with VBUS sourcing off, including when booting on a PD hub. */
+	ret = pinctrl_select_state(pinctrl, gpio->otg_boost_en_sleep);
+	if (ret)
+		return ret;
+	ret = pinctrl_select_state(pinctrl, gpio->otg_ovp_en_sleep);
+	if (ret)
+		return ret;
+	gpio->otg_boost_en_gpio = devm_fwnode_gpiod_get_index(dev, dev_fwnode(dev),
+			"qcom,otg-booster-en", 0, GPIOD_OUT_LOW, "otg-booster-en");
+	if (IS_ERR(gpio->otg_boost_en_gpio))
+		return dev_err_probe(dev, PTR_ERR(gpio->otg_boost_en_gpio),
+				     "failed to request OTG booster GPIO\n");
+	gpio->otg_ovp_en_gpio = devm_fwnode_gpiod_get_index(dev, dev_fwnode(dev),
+			"qcom,otg-ovp-en", 0, GPIOD_OUT_LOW, "otg-ovp-en");
+	if (IS_ERR(gpio->otg_ovp_en_gpio))
+		return dev_err_probe(dev, PTR_ERR(gpio->otg_ovp_en_gpio),
+				     "failed to request OTG OVP GPIO\n");
+	battmgr->bcdev->otg_boost_src = OTG_BOOST_SOURCE_EXTERNAL;
+	return devm_add_action_or_reset(dev, oplus_battmgr_disable_otg, battmgr->bcdev);
+}
+
 static void oplus_adsp_voocphy_err_work(struct work_struct *work)
 {
 
@@ -1077,6 +1182,14 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 		pr_err("Failed to read USB_ADAP_TYPE ret=%d\n", ret);
 		return;
 	}
+	if (battmgr->charge_limit_supported) {
+		ret = oplus_adsp_voocphy_enable(battmgr, true);
+		if (!ret)
+			ret = oplus_battmgr_negroni_usb_fcc(battmgr);
+		if (ret)
+			dev_warn_ratelimited(battmgr->dev,
+					     "failed to update VOOC data-path policy: %d\n", ret);
+	}
 
 	/* Reset usb_icl_ua whenever USB adapter type changes */
 	if (battmgr->usb.usb_type != POWER_SUPPLY_USB_TYPE_SDP &&
@@ -1112,11 +1225,6 @@ static void battery_chg_update_usb_type_work(struct work_struct *work)
 	case POWER_SUPPLY_USB_TYPE_PD:
 	case POWER_SUPPLY_USB_TYPE_PD_DRP:
 		usb_psy_desc.type = POWER_SUPPLY_TYPE_USB_PD;
-		if (!bcdev->pd_type_checked) {
-			bcdev->pd_type_checked = true;
-			chg_err("start check pd type\n");
-			schedule_delayed_work(&bcdev->pd_type_check_work, OPLUS_PD_TYPE_CHECK_INTERVAL);
-		}
 		break;
 	case POWER_SUPPLY_USB_TYPE_PD_PPS:
 	case POWER_SUPPLY_USB_TYPE_PD_SDP:
@@ -1630,7 +1738,9 @@ static int usb_get_property(struct power_supply *psy,
 		val->intval = battmgr->usb.current_limit;
 		break;
 	case POWER_SUPPLY_PROP_USB_TYPE:
-		val->intval = battmgr->usb.usb_type;
+		/* Oplus PD_SDP is outside the power_supply core's USB type enum. */
+		val->intval = battmgr->usb.usb_type == POWER_SUPPLY_USB_TYPE_PD_SDP ?
+			POWER_SUPPLY_USB_TYPE_PD : battmgr->usb.usb_type;
 		break;
 	case POWER_SUPPLY_PROP_TEMP:
 		val->intval = DIV_ROUND_CLOSEST((int)battmgr->usb.temp, 10);
@@ -2274,8 +2384,15 @@ static void oplus_adsp_crash_recover_func(struct work_struct *work)
 		return;
 	}
 	chip->charger_type  = POWER_SUPPLY_TYPE_UNKNOWN;
-	// if (chip->voocphy_support == ADSP_VOOCPHY)
-		oplus_adsp_voocphy_enable(bcdev->battmgr, true);
+	ret = oplus_adsp_voocphy_enable(battmgr, true);
+	if (!ret)
+		ret = oplus_battmgr_negroni_usb_fcc(battmgr);
+	if (ret) {
+		if (!READ_ONCE(battmgr->stopping) && READ_ONCE(battmgr->service_up))
+			mod_delayed_work(system_wq, &bcdev->adsp_crash_recover_work,
+					 msecs_to_jiffies(5000));
+		return;
+	}
 
 	schedule_delayed_work(&bcdev->otg_init_work, round_jiffies_relative(msecs_to_jiffies(2000)));
 	oplus_chg_update_work(bcdev);
@@ -2443,6 +2560,10 @@ static int oplus_battmgr_probe(struct auxiliary_device *adev,
 
 	if (bcdev->variant == OPLUS_BATTMGR_SM8750)
 		bcdev->soccp_support = true;
+
+	ret = oplus_battmgr_init_negroni_otg(battmgr);
+	if (ret)
+		return ret;
 
 	// ret = qcom_battmgr_charge_control_thresholds_init(battmgr);
 	// if (ret < 0)
