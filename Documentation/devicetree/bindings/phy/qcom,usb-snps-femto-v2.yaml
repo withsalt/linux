@@ -42,12 +42,16 @@ properties:
     const: 0
 
   clocks:
+    minItems: 1
     items:
       - description: rpmhcc ref clock
+      - description: Optional GCC reference clock gate
 
   clock-names:
+    minItems: 1
     items:
       - const: ref
+      - const: ref_gate
 
   resets:
     items:

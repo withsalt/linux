@@ -4,6 +4,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/io.h>
@@ -142,7 +143,7 @@ static int qcom_snps_hsphy_clk_init(struct qcom_snps_hsphy *hsphy)
 {
 	struct device *dev = hsphy->dev;
 
-	hsphy->num_clks = 2;
+	hsphy->num_clks = 3;
 	hsphy->clks = devm_kcalloc(dev, hsphy->num_clks, sizeof(*hsphy->clks), GFP_KERNEL);
 	if (!hsphy->clks)
 		return -ENOMEM;
@@ -162,6 +163,12 @@ static int qcom_snps_hsphy_clk_init(struct qcom_snps_hsphy *hsphy)
 	if (IS_ERR(hsphy->clks[1].clk))
 		return dev_err_probe(dev, PTR_ERR(hsphy->clks[1].clk),
 				     "failed to get ref clk\n");
+
+	hsphy->clks[2].id = "ref_gate";
+	hsphy->clks[2].clk = devm_clk_get_optional(dev, "ref_gate");
+	if (IS_ERR(hsphy->clks[2].clk))
+		return dev_err_probe(dev, PTR_ERR(hsphy->clks[2].clk),
+				     "failed to get ref gate clk\n");
 
 	return 0;
 }
@@ -193,7 +200,7 @@ static int qcom_snps_hsphy_suspend(struct qcom_snps_hsphy *hsphy)
 		usleep_range(500, 1000);
 		qcom_snps_hsphy_write_mask(hsphy->base,
 					   USB2_PHY_USB_PHY_HS_PHY_CTRL2,
-					   0, USB2_AUTO_RESUME);
+					   USB2_AUTO_RESUME, 0);
 	}
 
 	return 0;
@@ -224,15 +231,6 @@ static int __maybe_unused qcom_snps_hsphy_runtime_resume(struct device *dev)
 		return 0;
 
 	return qcom_snps_hsphy_resume(hsphy);
-}
-
-static int qcom_snps_hsphy_set_mode(struct phy *phy, enum phy_mode mode,
-				    int submode)
-{
-	struct qcom_snps_hsphy *hsphy = phy_get_drvdata(phy);
-
-	hsphy->mode = mode;
-	return 0;
 }
 
 static const struct override_param hs_disconnect_sc7280[] = {
@@ -426,7 +424,7 @@ static int qcom_snps_hsphy_init(struct phy *phy)
 					USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON1,
 					PLLBTUNE, PLLBTUNE);
 	qcom_snps_hsphy_write_mask(hsphy->base, USB2_PHY_USB_PHY_REFCLK_CTRL,
-					REFCLK_SEL_DEFAULT, REFCLK_SEL_MASK);
+					REFCLK_SEL_MASK, REFCLK_SEL_DEFAULT);
 	qcom_snps_hsphy_write_mask(hsphy->base,
 					USB2_PHY_USB_PHY_HS_PHY_CTRL_COMMON1,
 					VBUSVLDEXTSEL0, VBUSVLDEXTSEL0);
@@ -485,6 +483,22 @@ static int qcom_snps_hsphy_exit(struct phy *phy)
 	regulator_bulk_disable(ARRAY_SIZE(hsphy->vregs), hsphy->vregs);
 	hsphy->phy_initialized = false;
 
+	return 0;
+}
+
+static int qcom_snps_hsphy_set_mode(struct phy *phy, enum phy_mode mode,
+				    int submode)
+{
+	struct qcom_snps_hsphy *hsphy = phy_get_drvdata(phy);
+
+	hsphy->mode = mode;
+	/* Firmware can turn off the shared reference gate after early init. */
+	if (hsphy->phy_initialized && hsphy->clks[2].clk &&
+	    !__clk_is_enabled(hsphy->clks[2].clk)) {
+		dev_info(hsphy->dev, "restoring USB2 PHY after reference clock loss\n");
+		qcom_snps_hsphy_exit(phy);
+		return qcom_snps_hsphy_init(phy);
+	}
 	return 0;
 }
 

@@ -255,7 +255,7 @@
 		qcom,protection-domain = "tms/servreg", "msm/adsp/charger_pd";
 		orientation-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
 
-		/* OTG GPIOs — consumed by qcom_battmgr.c */
+		/* External VBUS boost and OVP, controlled by oplus_battmgr. */
 		qcom,otg-booster-en-gpio = <&tlmm 64 0x00>;
 		qcom,otg-ovp-en-gpio = <&tlmm 57 0x00>;
 
@@ -1659,9 +1659,22 @@
 };
 
 &usb_1_hsphy {
+	clocks = <&rpmhcc RPMH_CXO_CLK>, <&gcc GCC_EUSB3_0_CLKREF_EN>;
+	clock-names = "ref", "ref_gate";
 	vdda-pll-supply = <&pm8350_l5>;
 	vdda18-supply = <&pm8350c_l1>;
 	vdda33-supply = <&pm8350_l2>;
+
+	/* Stock wly/20846 USB2 eye and receiver threshold settings. */
+	qcom,hs-disconnect-bp = <2156>;
+	qcom,squelch-detector-bp = <(-2090)>;
+	qcom,hs-amplitude-bp = <2670>;
+	qcom,pre-emphasis-duration-bp = <20000>;
+	qcom,pre-emphasis-amplitude-bp = <40000>;
+	qcom,hs-rise-fall-time-bp = <(-4100)>;
+	qcom,hs-crossover-voltage-microvolt = <(-31000)>;
+	qcom,hs-output-impedance-micro-ohms = <2600000>;
+	qcom,ls-fs-output-impedance-bp = <0>;
 	status = "okay";
 };
 
