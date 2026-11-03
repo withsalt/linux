@@ -1383,6 +1383,71 @@ static int bat_update(struct qcom_battmgr *battmgr,
 	return oplus_battmgr_request_property(battmgr, BC_BATTERY_STATUS_GET, prop, 0);;
 }
 
+static int oplus_battmgr_negroni_get_status(struct qcom_battmgr *battmgr,
+					 union power_supply_propval *val)
+{
+	unsigned int generation;
+	int current_ua, ret;
+
+	/*
+	 * Oplus computes battery status on the AP; BATT_STATUS alone can report
+	 * discharging while the external charger is charging the battery.
+	 * Keep all samples and the policy acknowledgement in one transaction.
+	 */
+	mutex_lock(&battmgr->lock);
+	generation = READ_ONCE(battmgr->service_generation);
+	if (!battmgr->service_up || !battmgr->gauge_init_done) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_USB_STATUS_GET,
+						   USB_ONLINE, 0);
+	if (ret)
+		goto out;
+	if (!battmgr->usb.online) {
+		ret = oplus_battmgr_request_property_locked(battmgr, BC_WLS_STATUS_GET,
+							   WLS_ONLINE, 0);
+		if (ret)
+			goto out;
+		if (!battmgr->wireless.online) {
+			val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+			goto check_generation;
+		}
+	}
+
+	ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_GET,
+						   BATT_CURR_NOW, 0);
+	if (ret)
+		goto out;
+	/* Negroni's gauge uses negative current for charge, positive for drain. */
+	current_ua = battmgr->status.current_now;
+	if (current_ua > 0) {
+		/* A weak external supply can leave the battery supplying the load. */
+		val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
+	} else if (battmgr->charge_limit_applied_valid && battmgr->charge_limit_applied &&
+		   battmgr->charge_limit_generation == generation) {
+		val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+	} else if (current_ua < 0) {
+		val->intval = POWER_SUPPLY_STATUS_CHARGING;
+	} else {
+		ret = oplus_battmgr_request_property_locked(battmgr, BC_BATTERY_STATUS_GET,
+							   BATT_STATUS, 0);
+		if (ret)
+			goto out;
+		val->intval = battmgr->status.status == POWER_SUPPLY_STATUS_FULL ?
+			POWER_SUPPLY_STATUS_FULL : POWER_SUPPLY_STATUS_NOT_CHARGING;
+	}
+
+check_generation:
+	if (!READ_ONCE(battmgr->service_up) ||
+	    generation != READ_ONCE(battmgr->service_generation))
+		ret = -EAGAIN;
+out:
+	mutex_unlock(&battmgr->lock);
+	return ret;
+}
+
 static int battery_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
@@ -1403,6 +1468,9 @@ static int battery_get_property(struct power_supply *psy,
 	if (!battmgr->service_up)
 		return -EAGAIN;
 
+	if (battmgr->charge_limit_supported && psp == POWER_SUPPLY_PROP_STATUS)
+		return oplus_battmgr_negroni_get_status(battmgr, val);
+
 	ret = bat_update(battmgr, psp);
 	if (ret < 0)
 		return ret;
@@ -1410,14 +1478,6 @@ static int battery_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
-		if (battmgr->charge_limit_supported) {
-			mutex_lock(&battmgr->lock);
-			if ((battmgr->usb.online || battmgr->wireless.online) &&
-			    battmgr->charge_limit_applied_valid && battmgr->charge_limit_applied &&
-			    battmgr->charge_limit_generation == READ_ONCE(battmgr->service_generation))
-				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
-			mutex_unlock(&battmgr->lock);
-		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
