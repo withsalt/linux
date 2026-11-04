@@ -14,9 +14,7 @@
 #include <linux/usb/hcd.h>
 #include <linux/bitfield.h>
 
-#include "../host/xhci-port.h"
-#include "../host/xhci-ext-caps.h"
-#include "../host/xhci-caps.h"
+#include "../host/xhci.h"
 #include "../host/xhci-plat.h"
 #include "core.h"
 
@@ -81,6 +79,23 @@ static void dwc3_xhci_plat_start(struct usb_hcd *hcd)
 static const struct xhci_plat_priv dwc3_xhci_plat_quirk = {
 	.plat_start = dwc3_xhci_plat_start,
 };
+
+void dwc3_host_set_power_lost(struct dwc3 *dwc, bool power_lost)
+{
+	struct xhci_plat_priv *priv;
+	struct usb_hcd *hcd;
+
+	if (!dwc->xhci)
+		return;
+
+	/* The asynchronously probed xHCI child may not have bound yet. */
+	hcd = platform_get_drvdata(dwc->xhci);
+	if (!hcd)
+		return;
+
+	priv = hcd_to_xhci_priv(hcd);
+	priv->power_lost = power_lost;
+}
 
 static void dwc3_host_fill_xhci_irq_res(struct dwc3 *dwc,
 					int irq, char *name)

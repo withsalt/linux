@@ -2559,6 +2559,8 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 	case DWC3_GCTL_PRTCAP_HOST:
 		if (!PMSG_IS_AUTO(msg) &&
 		    (!device_may_wakeup(dwc->dev) || dwc->needs_full_reinit)) {
+			/* A core reset invalidates xHCI's saved controller state. */
+			dwc3_host_set_power_lost(dwc, true);
 			dwc3_core_exit(dwc);
 			break;
 		}
@@ -2595,6 +2597,8 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 		}
 
 		dwc3_otg_exit(dwc);
+		if (dwc->current_otg_role == DWC3_OTG_ROLE_HOST)
+			dwc3_host_set_power_lost(dwc, true);
 		dwc3_core_exit(dwc);
 		break;
 	default:
@@ -2830,6 +2834,9 @@ EXPORT_SYMBOL_GPL(dwc3_pm_complete);
 int dwc3_pm_prepare(struct dwc3 *dwc)
 {
 	struct device *dev = dwc->dev;
+
+	/* A previous suspend must not force a reset if this one is aborted. */
+	dwc3_host_set_power_lost(dwc, false);
 
 	/*
 	 * Indicate to the PM core that it may safely leave the device in
