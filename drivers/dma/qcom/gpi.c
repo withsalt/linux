@@ -527,6 +527,7 @@ struct gpi_desc {
 	struct gchan *gchan;
 	struct gpi_tre tre[MAX_TRE];
 	u32 num_tre;
+	bool linked_rx;
 };
 
 static const u32 GPII_CHAN_DIR[MAX_CHANNELS_PER_GPII] = {
@@ -910,6 +911,44 @@ exit_irq:
 	return IRQ_HANDLED;
 }
 
+/*
+ * An I2C read queues a linked GO on TX and the data TRE on RX. The GO
+ * does not request a TX completion event. Once RX completes, hardware has
+ * consumed that GO, so retire its descriptor before waking the client.
+ * Otherwise the TX ring fills even though every read completed on RX.
+ */
+static void gpi_reclaim_linked_tx(struct gchan *rx_chan)
+{
+	struct gchan *tx_chan = &rx_chan->gpii->gchan[GPI_TX_CHAN];
+	struct virt_dma_desc *vd;
+	struct gpi_desc *desc;
+	unsigned long flags;
+
+	if (rx_chan->chid != GPI_RX_CHAN || rx_chan->protocol != QCOM_GPI_I2C)
+		return;
+
+	spin_lock_irqsave(&tx_chan->vc.lock, flags);
+	vd = vchan_next_desc(&tx_chan->vc);
+	if (!vd)
+		goto unlock;
+
+	desc = to_gpi_desc(vd);
+	if (!desc->linked_rx)
+		goto unlock;
+
+	tx_chan->ch_ring.rp = desc->db;
+	dma_cookie_complete(&vd->tx);
+	list_del(&vd->node);
+	spin_unlock_irqrestore(&tx_chan->vc.lock, flags);
+	smp_wmb();
+	/* Only RX reports completion to the I2C client. */
+	kfree(desc);
+	return;
+
+unlock:
+	spin_unlock_irqrestore(&tx_chan->vc.lock, flags);
+}
+
 /* process DMA Immediate completion data events */
 static void gpi_process_imed_data_event(struct gchan *gchan,
 					struct immediate_data_event *imed_event)
@@ -981,6 +1020,7 @@ static void gpi_process_imed_data_event(struct gchan *gchan,
 		result.result = DMA_TRANS_NOERROR;
 	result.residue = gpi_desc->len - imed_event->length;
 
+	gpi_reclaim_linked_tx(gchan);
 	dma_cookie_complete(&vd->tx);
 	dmaengine_desc_get_callback_invoke(&vd->tx, &result);
 
@@ -1060,6 +1100,7 @@ static void gpi_process_xfer_compl_event(struct gchan *gchan,
 	result.residue = gpi_desc->len - compl_event->length;
 	dev_dbg(gpii->gpi_dev->dev, "Residue %d\n", result.residue);
 
+	gpi_reclaim_linked_tx(gchan);
 	dma_cookie_complete(&vd->tx);
 	dmaengine_desc_get_callback_invoke(&vd->tx, &result);
 
@@ -1668,10 +1709,12 @@ static int gpi_create_i2c_tre(struct gchan *chan, struct gpi_desc *desc,
 
 		tre->dword[3] = u32_encode_bits(TRE_TYPE_GO, TRE_FLAGS_TYPE);
 
-		if (i2c->multi_msg)
+		if (i2c->multi_msg) {
 			tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_LINK);
-		else
+			desc->linked_rx = true;
+		} else {
 			tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_CHAIN);
+		}
 	}
 
 	if (i2c->op == I2C_READ || i2c->multi_msg == false) {
@@ -1823,6 +1866,9 @@ gpi_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 	set_config = *(u32 *)gchan->config;
 	if (!set_config)
 		nr_tre = 2;
+	if (direction == DMA_MEM_TO_DEV && gchan->protocol == QCOM_GPI_I2C &&
+	    ((struct gpi_i2c_config *)gchan->config)->multi_msg)
+		nr_tre--; /* linked read GO has no TX data TRE */
 	if (direction == DMA_DEV_TO_MEM) /* rx */
 		nr_tre = 1;
 
